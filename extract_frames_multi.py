@@ -15,6 +15,11 @@ import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
 
+# ── Офсеты камеры относительно антенны ──────────────────────────────────────
+CAMERA_OFFSET_FORWARD_M = 0.45   # смещение вперёд по траектории (м)
+CAMERA_OFFSET_UP_M = 0.74        # смещение вверх (м)
+
+
 def safe_float(v, default=None):
     try:
         if v is None or v == "": return default
@@ -185,6 +190,37 @@ def interpolate_pos_row(r0, r1, alpha):
     }
 
 
+def apply_camera_offset(pos, heading_deg, camera_offset_forward_m, camera_offset_up_m):
+    """
+    [NEW] Применить офсет камеры к позиции антенны.
+    
+    heading_deg: курс в градусах (0° = север, 90° = восток)
+    camera_offset_forward_m: смещение вперёд по направлению движения (м)
+    camera_offset_up_m: смещение вверх (м)
+    
+    Возвращает скорректированную позицию с учётом смещения камеры.
+    """
+    if heading_deg is None or heading_deg == "":
+        return pos  # Нет данных о курсе — возвращаем исходную позицию
+    
+    heading_rad = math.radians(float(heading_deg))
+    
+    # Смещение по курсу (вперёд по траектории)
+    if camera_offset_forward_m != 0:
+        offset_dist_m = camera_offset_forward_m
+        delta_lat = offset_dist_m / 6371008.8 * math.cos(heading_rad) * (180.0 / math.pi)
+        delta_lon = offset_dist_m / 6371008.8 * math.sin(heading_rad) / math.cos(
+            math.radians(pos["lat_deg"])) * (180.0 / math.pi)
+        pos["lat_deg"] += delta_lat
+        pos["lon_deg"] += delta_lon
+    
+    # Смещение по высоте (вверх)
+    if camera_offset_up_m != 0:
+        pos["height_m"] += camera_offset_up_m
+    
+    return pos
+
+
 def pos_at_utc_ts(pos_rows, utc_ts):
     xs = [r["utc_ts"] for r in pos_rows]
     if utc_ts < xs[0] or utc_ts > xs[-1]:
@@ -269,7 +305,7 @@ def attitude_at_utc_ts(att_rows, utc_ts):
     }
 
 
-# ── Кусочно-якорная коррекция ────────────────────────────────────────────────
+# ── Кусочно-якорная коррекция ───────────────────────────────────────────────
 def extract_reliable_anchors(pairs, quality_level="medium", verbose=True):
     """
     quality_level: 
@@ -604,22 +640,35 @@ def build_frame_plan_by_distance(pos_rows, pairs, distance_step_m, fps, frame_co
             d1 = seg_cum[min(local_seg_idx + 1, len(seg_cum) - 1)]
             alpha_pos = clamp((local_m - d0) / (d1 - d0) if d1 != d0 else 0.0, 0.0, 1.0)
             pos = interpolate_pos_row(r0, r1, alpha_pos)
+            
+            # ── Применить офсет камеры ──
+            # Получаем курс из attitude data
+            att = attitude_at_utc_ts(att_rows, pos["utc_ts"])
+            heading_deg = att["heading_deg"]
+            
+            # Применяем офсет относительно курса движения
+            pos_with_offset = apply_camera_offset(
+                pos.copy(), 
+                heading_deg,
+                CAMERA_OFFSET_FORWARD_M,
+                CAMERA_OFFSET_UP_M
+            )
+            
             alpha_vid = clamp((pos["utc_ts"] - utc_left) / dt_utc if dt_utc > 0 else 0.0, 0.0, 1.0)
             video_time_sec = vid_left + alpha_vid * dt_video
-            att = attitude_at_utc_ts(att_rows, pos["utc_ts"])
             all_rows.append({
                 "distance_m":          global_distance_m + local_m,
                 "video_time_sec":      video_time_sec,
                 "frame_idx":           clamp(int(round(video_time_sec * fps)), 0, frame_count - 1),
-                "utc_datetime":        iso_utc_from_ts(pos["utc_ts"]),
-                "gpst_datetime":       pos["gpst_datetime"].isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-                "lat_deg":    pos["lat_deg"],   "lon_deg":  pos["lon_deg"],
-                "height_m":   pos["height_m"],  "Q":        pos["Q"],    "ns": pos["ns"],
-                "sdn_m":      pos["sdn_m"],      "sde_m":    pos["sde_m"],
-                "sdu_m":      pos["sdu_m"],
-                "sdne_m":     pos["sdne_m"],     "sdeu_m":   pos["sdeu_m"],
-                "sdun_m":     pos["sdun_m"],     "age_s":    pos["age_s"],
-                "ratio":      pos["ratio"],
+                "utc_datetime":        iso_utc_from_ts(pos_with_offset["utc_ts"]),
+                "gpst_datetime":       pos_with_offset["gpst_datetime"].isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "lat_deg":    pos_with_offset["lat_deg"],   "lon_deg":  pos_with_offset["lon_deg"],
+                "height_m":   pos_with_offset["height_m"],  "Q":        pos_with_offset["Q"],    "ns": pos_with_offset["ns"],
+                "sdn_m":      pos_with_offset["sdn_m"],      "sde_m":    pos_with_offset["sde_m"],
+                "sdu_m":      pos_with_offset["sdu_m"],
+                "sdne_m":     pos_with_offset["sdne_m"],     "sdeu_m":   pos_with_offset["sdeu_m"],
+                "sdun_m":     pos_with_offset["sdun_m"],     "age_s":    pos_with_offset["age_s"],
+                "ratio":      pos_with_offset["ratio"],
                 "heading_deg":  att["heading_deg"],
                 "roll_deg":     att["roll_deg"],
                 "pitch_deg":    att["pitch_deg"],
@@ -951,6 +1000,7 @@ def main():
     print(f"POS UTC: {iso_utc_from_ts(pos_rows[0]['utc_ts'])} .. {iso_utc_from_ts(pos_rows[-1]['utc_ts'])}")
 
     print(f"\nЯкорная коррекция: {'ВКЛЮЧЕНА' if use_anchor_correction else 'ОТКЛЮЧЕНА'}")
+    print(f"Офсет камеры: вперёд +{CAMERA_OFFSET_FORWARD_M}м, вверх +{CAMERA_OFFSET_UP_M}м")
 
     rows = extract_frames_multi(
         video_jobs=video_jobs,
